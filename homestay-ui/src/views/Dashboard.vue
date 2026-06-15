@@ -82,6 +82,17 @@
           />
         </div>
       </div>
+      <div class="center-col">
+        <RevenuePanel
+          title="动态收益预测"
+          :daily-forecast="store.revenueForecast"
+          :channel-breakdown="store.revenueChannelBreakdown"
+          :summary="store.revenueSummary"
+          :loading="store.revenueLoading"
+          :has-error="store.revenueError"
+          @retry="retryRevenue"
+        />
+      </div>
       <div class="right-col">
         <div class="row-1">
           <ChannelChart
@@ -111,6 +122,7 @@ import StatCard from '@/components/StatCard.vue'
 import RealtimeRoomPanel from '@/components/RealtimeRoomPanel.vue'
 import ChannelChart from '@/components/ChannelChart.vue'
 import HeatmapChart from '@/components/HeatmapChart.vue'
+import RevenuePanel from '@/components/RevenuePanel.vue'
 import { Refresh } from '@element-plus/icons-vue'
 
 const store = useDashboardStore()
@@ -142,6 +154,13 @@ const retryHeatmap = () => {
   store.fetchHeatmap(start, end)
 }
 
+const retryRevenue = () => {
+  const today = dayjs()
+  const start = today.format('YYYY-MM-DD')
+  const end = today.add(30, 'day').format('YYYY-MM-DD')
+  store.fetchRevenueAnalysis(start, end)
+}
+
 const fetchAll = async () => {
   let start, end
   const today = dayjs()
@@ -151,10 +170,13 @@ const fetchAll = async () => {
     case '90d': start = today.subtract(90, 'day').format('YYYY-MM-DD'); end = today.add(30, 'day').format('YYYY-MM-DD'); break
     default: start = today.subtract(30, 'day').format('YYYY-MM-DD'); end = today.add(30, 'day').format('YYYY-MM-DD')
   }
+  const revenueStart = today.format('YYYY-MM-DD')
+  const revenueEnd = today.add(30, 'day').format('YYYY-MM-DD')
   await Promise.all([
     store.fetchRealtimeData(),
     store.fetchChannelDistribution(start, end),
-    store.fetchHeatmap(start, end)
+    store.fetchHeatmap(start, end),
+    store.fetchRevenueAnalysis(revenueStart, revenueEnd)
   ])
 }
 
@@ -240,11 +262,11 @@ onBeforeUnmount(() => {
 .charts-section {
   flex: 1;
   display: grid;
-  grid-template-columns: 1.6fr 1fr;
+  grid-template-columns: 1.2fr 1.4fr 0.9fr;
   gap: 16px;
   min-height: 0;
 
-  .left-col, .right-col {
+  .left-col, .center-col, .right-col {
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -254,6 +276,10 @@ onBeforeUnmount(() => {
   .left-col {
     .row-1 { flex: 1.1; min-height: 0; }
     .row-2 { flex: 1; min-height: 0; }
+  }
+
+  .center-col {
+    min-height: 0;
   }
 
   .right-col {

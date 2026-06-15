@@ -5,6 +5,7 @@ import {
   getChannelOrderDistribution,
   getRoomTypeHeatmap
 } from '@/api/dashboard'
+import { getRevenueAnalysis } from '@/api/revenue'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -16,7 +17,12 @@ export const useDashboardStore = defineStore('dashboard', {
     realtimeLoading: false,
     channelLoading: false,
     heatmapLoading: false,
-    heatmapError: false
+    heatmapError: false,
+    revenueForecast: [],
+    revenueChannelBreakdown: [],
+    revenueSummary: null,
+    revenueLoading: false,
+    revenueError: false
   }),
   getters: {
     totalRooms: (state) => {
@@ -85,6 +91,36 @@ export const useDashboardStore = defineStore('dashboard', {
         this.heatmapData = []
       } finally {
         this.heatmapLoading = false
+      }
+    },
+    async fetchRevenueAnalysis(startDate, endDate) {
+      this.revenueLoading = true
+      this.revenueError = false
+      try {
+        const res = await getRevenueAnalysis(startDate, endDate)
+        if (res.code === 200 && res.data) {
+          this.revenueForecast = res.data.dailyForecast || []
+          this.revenueChannelBreakdown = res.data.channelBreakdown || []
+          this.revenueSummary = {
+            totalGrossRevenue: res.data.totalGrossRevenue,
+            totalPlatformFee: res.data.totalPlatformFee,
+            totalNetProfit: res.data.totalNetProfit,
+            avgNetRate: res.data.avgNetRate
+          }
+        } else {
+          this.revenueError = true
+          this.revenueForecast = []
+          this.revenueChannelBreakdown = []
+          this.revenueSummary = null
+        }
+      } catch (e) {
+        console.error('获取收益分析数据失败', e)
+        this.revenueError = true
+        this.revenueForecast = []
+        this.revenueChannelBreakdown = []
+        this.revenueSummary = null
+      } finally {
+        this.revenueLoading = false
       }
     },
     setRealtimeData(data) {
