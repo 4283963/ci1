@@ -76,6 +76,9 @@
           <HeatmapChart
             title="房型热度热力图"
             :heatmap-data="store.heatmapData"
+            :loading="store.heatmapLoading"
+            :has-error="store.heatmapError"
+            @retry="retryHeatmap"
           />
         </div>
       </div>
@@ -125,6 +128,18 @@ const totalRevenueDisplay = computed(() => {
 
 const onDateChange = () => {
   fetchAll()
+}
+
+const retryHeatmap = () => {
+  let start, end
+  const today = dayjs()
+  switch (dateRange.value) {
+    case 'today': start = today.format('YYYY-MM-DD'); end = today.format('YYYY-MM-DD'); break
+    case '7d': start = today.subtract(7, 'day').format('YYYY-MM-DD'); end = today.format('YYYY-MM-DD'); break
+    case '90d': start = today.subtract(90, 'day').format('YYYY-MM-DD'); end = today.add(30, 'day').format('YYYY-MM-DD'); break
+    default: start = today.subtract(30, 'day').format('YYYY-MM-DD'); end = today.add(30, 'day').format('YYYY-MM-DD')
+  }
+  store.fetchHeatmap(start, end)
 }
 
 const fetchAll = async () => {

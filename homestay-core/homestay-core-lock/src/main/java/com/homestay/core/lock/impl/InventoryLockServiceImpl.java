@@ -2,7 +2,6 @@ package com.homestay.core.lock.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.homestay.core.common.enums.InventoryChangeTypeEnum;
 import com.homestay.core.common.enums.LockTypeEnum;
 import com.homestay.core.common.exception.BusinessException;
 import com.homestay.core.common.exception.InventoryInsufficientException;
@@ -17,11 +16,17 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DeadlockLoserDataAccessException;
+import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -35,26 +40,25 @@ public class InventoryLockServiceImpl implements InventoryLockService {
     private final BaseMapper<InventoryLock> lockMapper;
     private final BaseMapper<Inventory> inventoryMapper;
 
+    private static final int MAX_RETRY = 3;
+    private static final long RETRY_BASE_MS = 50;
+
     @Override
     @Transactional(rollbackFor = Exception.class)
-    @DistributedLock(key = "#dto.roomTypeId + '_' + #dto.startDate + '_' + #dto.endDate",
+    @DistributedLock(key = "#dto.roomTypeId",
                      prefix = "HOMESTAY:INV:LOCK",
-                     waitTime = 5, leaseTime = 60)
+                     waitTime = 10, leaseTime = 120)
     public InventoryLock tryLock(InventoryLockDTO dto) {
-        log.info("开始尝试库存锁定: roomTypeId={}, start={}, end={}, count={}",
-                dto.getRoomTypeId(), dto.getStartDate(), dto.getEndDate(), dto.getLockCount());
+        return executeWithRetry("tryLock", () -> doTryLock(dto));
+    }
+
+    private InventoryLock doTryLock(InventoryLockDTO dto) {
+        log.info("开始尝试库存锁定: roomTypeId={}, start={}, end={}, count={}, source={}",
+                dto.getRoomTypeId(), dto.getStartDate(), dto.getEndDate(),
+                dto.getLockCount(), dto.getSourceType());
 
         List<LocalDate> dateRange = DateUtils.getDateRange(dto.getStartDate(), dto.getEndDate());
-        for (LocalDate date : dateRange) {
-            Inventory inv = inventoryService.getInventory(dto.getRoomTypeId(), date);
-            if (inv == null) {
-                throw BusinessException.of(String.format("房型[%d]在[%s]的库存未初始化", dto.getRoomTypeId(), date));
-            }
-            int available = inv.getTotalRooms() - inv.getBookedRooms() - inv.getLockedRooms();
-            if (available < dto.getLockCount()) {
-                throw InventoryInsufficientException.of(dto.getRoomTypeId(), date.toString(), dto.getLockCount(), available);
-            }
-        }
+        Collections.sort(dateRange);
 
         String lockKey = DateUtils.generateLockKey(
                 dto.getRoomTypeId(), dto.getStartDate(), dto.getEndDate(),
@@ -65,20 +69,46 @@ public class InventoryLockServiceImpl implements InventoryLockService {
         existingWrapper.eq(InventoryLock::getLockKey, lockKey);
         InventoryLock existing = lockMapper.selectOne(existingWrapper);
         if (existing != null && existing.getStatus() == 1) {
-            log.warn("库存锁已存在: lockKey={}", lockKey);
+            log.warn("库存锁已存在，直接返回: lockKey={}", lockKey);
             return existing;
         }
 
-        for (LocalDate date : dateRange) {
-            int updated = inventoryMapper.update(null, new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<Inventory>()
-                    .eq(Inventory::getRoomTypeId, dto.getRoomTypeId())
-                    .eq(Inventory::getStayDate, date)
-                    .ge(Inventory::getAvailableRooms, dto.getLockCount())
-                    .setSql("locked_rooms = locked_rooms + " + dto.getLockCount())
-                    .setSql("available_rooms = available_rooms - " + dto.getLockCount())
-                    .setSql("version = version + 1")
-                    .set(Inventory::getUpdatedAt, LocalDateTime.now())
-                    .eq(Inventory::getVersion, inventoryService.getInventory(dto.getRoomTypeId(), date).getVersion())
+        List<Inventory> inventories = inventoryMapper.selectList(
+                new LambdaQueryWrapper<Inventory>()
+                        .eq(Inventory::getRoomTypeId, dto.getRoomTypeId())
+                        .ge(Inventory::getStayDate, dto.getStartDate())
+                        .le(Inventory::getStayDate, dto.getEndDate())
+                        .orderByAsc(Inventory::getStayDate)
+                        .last("FOR UPDATE")
+        );
+
+        if (inventories.size() != dateRange.size()) {
+            for (LocalDate date : dateRange) {
+                boolean found = inventories.stream().anyMatch(inv -> inv.getStayDate().equals(date));
+                if (!found) {
+                    throw BusinessException.of(String.format("房型[%d]在[%s]的库存未初始化", dto.getRoomTypeId(), date));
+                }
+            }
+        }
+
+        for (Inventory inv : inventories) {
+            int available = inv.getTotalRooms() - inv.getBookedRooms() - inv.getLockedRooms();
+            if (available < dto.getLockCount()) {
+                throw InventoryInsufficientException.of(
+                        dto.getRoomTypeId(), inv.getStayDate().toString(),
+                        dto.getLockCount(), available);
+            }
+        }
+
+        for (Inventory inv : inventories) {
+            int updated = inventoryMapper.update(null,
+                    new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<Inventory>()
+                            .eq(Inventory::getId, inv.getId())
+                            .ge(Inventory::getAvailableRooms, dto.getLockCount())
+                            .setSql("locked_rooms = locked_rooms + " + dto.getLockCount())
+                            .setSql("available_rooms = available_rooms - " + dto.getLockCount())
+                            .setSql("version = version + 1")
+                            .set(Inventory::getUpdatedAt, LocalDateTime.now())
             );
             if (updated <= 0) {
                 throw new RuntimeException("库存锁定失败，存在并发冲突，请重试");
@@ -107,51 +137,71 @@ public class InventoryLockServiceImpl implements InventoryLockService {
         RLock redissonLock = redissonClient.getLock("LOCK:RECORD:" + lock.getId());
         redissonLock.expire(expire, TimeUnit.MINUTES);
 
-        log.info("库存锁定成功: lockId={}, lockKey={}", lock.getId(), lockKey);
+        log.info("库存锁定成功: lockId={}, lockKey={}, 影响天数={}", lock.getId(), lockKey, dateRange.size());
         return lock;
     }
 
     @Override
     @Transactional(rollbackFor = Exception.class)
     public boolean confirmLock(Long lockId) {
-        InventoryLock lock = lockMapper.selectById(lockId);
-        if (lock == null) {
-            throw BusinessException.of("库存锁不存在: " + lockId);
-        }
-        if (lock.getStatus() != 1) {
-            throw BusinessException.of("库存锁状态异常，无法确认");
-        }
-        if (lock.getExpireAt().isBefore(LocalDateTime.now())) {
-            releaseLock(lockId);
-            throw BusinessException.of("库存锁已过期");
-        }
+        return executeWithRetry("confirmLock", () -> {
+            InventoryLock lock = lockMapper.selectById(lockId);
+            if (lock == null) {
+                throw BusinessException.of("库存锁不存在: " + lockId);
+            }
+            if (lock.getStatus() != 1) {
+                throw BusinessException.of("库存锁状态异常，无法确认");
+            }
+            if (lock.getExpireAt().isBefore(LocalDateTime.now())) {
+                releaseLock(lockId);
+                throw BusinessException.of("库存锁已过期");
+            }
 
-        lock.setLockType(LockTypeEnum.CONFIRM_LOCK.getCode());
-        lock.setExpireAt(lock.getEndDate().atStartOfDay().plusDays(1));
-        lock.setUpdatedAt(LocalDateTime.now());
-        lockMapper.updateById(lock);
-        log.info("库存锁确认成功: lockId={}", lockId);
-        return true;
+            lock.setLockType(LockTypeEnum.CONFIRM_LOCK.getCode());
+            lock.setExpireAt(lock.getEndDate().atStartOfDay().plusDays(1));
+            lock.setUpdatedAt(LocalDateTime.now());
+            lockMapper.updateById(lock);
+            log.info("库存锁确认成功: lockId={}", lockId);
+            return true;
+        });
     }
 
     @Override
     @Transactional(rollbackFor = Exception.class)
     public boolean releaseLock(Long lockId) {
+        return executeWithRetry("releaseLock", () -> doReleaseLock(lockId));
+    }
+
+    private boolean doReleaseLock(Long lockId) {
         InventoryLock lock = lockMapper.selectById(lockId);
         if (lock == null || lock.getStatus() != 1) {
             return true;
         }
 
         List<LocalDate> dateRange = DateUtils.getDateRange(lock.getStartDate(), lock.getEndDate());
-        for (LocalDate date : dateRange) {
-            inventoryMapper.update(null, new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<Inventory>()
-                    .eq(Inventory::getRoomTypeId, lock.getRoomTypeId())
-                    .eq(Inventory::getStayDate, date)
-                    .ge(Inventory::getLockedRooms, lock.getLockCount())
-                    .setSql("locked_rooms = locked_rooms - " + lock.getLockCount())
-                    .setSql("available_rooms = available_rooms + " + lock.getLockCount())
-                    .setSql("version = version + 1")
-                    .set(Inventory::getUpdatedAt, LocalDateTime.now())
+        Collections.sort(dateRange);
+
+        List<Inventory> inventories = inventoryMapper.selectList(
+                new LambdaQueryWrapper<Inventory>()
+                        .eq(Inventory::getRoomTypeId(), lock.getRoomTypeId())
+                        .ge(Inventory::getStayDate, lock.getStartDate())
+                        .le(Inventory::getStayDate, lock.getEndDate())
+                        .orderByAsc(Inventory::getStayDate)
+                        .last("FOR UPDATE")
+        );
+
+        for (Inventory inv : inventories) {
+            int releaseCount = Math.min(lock.getLockCount(), inv.getLockedRooms());
+            if (releaseCount <= 0) continue;
+
+            inventoryMapper.update(null,
+                    new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<Inventory>()
+                            .eq(Inventory::getId, inv.getId())
+                            .ge(Inventory::getLockedRooms, releaseCount)
+                            .setSql("locked_rooms = locked_rooms - " + releaseCount)
+                            .setSql("available_rooms = available_rooms + " + releaseCount)
+                            .setSql("version = version + 1")
+                            .set(Inventory::getUpdatedAt, LocalDateTime.now())
             );
         }
 
@@ -159,7 +209,7 @@ public class InventoryLockServiceImpl implements InventoryLockService {
         lock.setUnlockAt(LocalDateTime.now());
         lock.setUpdatedAt(LocalDateTime.now());
         lockMapper.updateById(lock);
-        log.info("库存锁释放成功: lockId={}", lockId);
+        log.info("库存锁释放成功: lockId={}, 释放天数={}", lockId, dateRange.size());
         return true;
     }
 
@@ -171,6 +221,7 @@ public class InventoryLockServiceImpl implements InventoryLockService {
                 .eq(InventoryLock::getSourceId, sourceId)
                 .eq(InventoryLock::getStatus, 1);
         List<InventoryLock> locks = lockMapper.selectList(wrapper);
+        locks.sort(Comparator.comparing(InventoryLock::getId));
         for (InventoryLock lock : locks) {
             releaseLock(lock.getId());
         }
@@ -203,15 +254,81 @@ public class InventoryLockServiceImpl implements InventoryLockService {
         log.info("开始清理过期库存锁");
         LambdaQueryWrapper<InventoryLock> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(InventoryLock::getStatus, 1)
-                .lt(InventoryLock::getExpireAt, LocalDateTime.now());
+                .lt(InventoryLock::getExpireAt, LocalDateTime.now())
+                .orderByAsc(InventoryLock::getId);
         List<InventoryLock> expiredLocks = lockMapper.selectList(wrapper);
+        int success = 0;
         for (InventoryLock lock : expiredLocks) {
             try {
                 releaseLock(lock.getId());
+                success++;
             } catch (Exception e) {
                 log.error("清理过期锁失败: lockId={}", lock.getId(), e);
             }
         }
-        log.info("清理过期库存锁完成，数量={}", expiredLocks.size());
+        log.info("清理过期库存锁完成，总数={}, 成功={}", expiredLocks.size(), success);
+    }
+
+    @FunctionalInterface
+    private interface RetryCallable<T> {
+        T call() throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface RetryRunnable {
+        void run() throws Exception;
+    }
+
+    private <T> T executeWithRetry(String operationName, RetryCallable<T> action) {
+        Exception lastException = null;
+        for (int attempt = 1; attempt <= MAX_RETRY; attempt++) {
+            try {
+                return action.call();
+            } catch (DeadlockLoserDataAccessException | CannotAcquireLockException e) {
+                lastException = e;
+                log.warn("数据库锁冲突，第{}次重试: operation={}, reason={}", attempt, operationName, e.getMessage());
+                sleepBackoff(attempt);
+            } catch (RuntimeException e) {
+                if (isDeadlockRelated(e)) {
+                    lastException = e;
+                    log.warn("检测到死锁相关异常，第{}次重试: operation={}", attempt, operationName);
+                    sleepBackoff(attempt);
+                } else {
+                    throw e;
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+        log.error("重试{}次后仍然失败: operation={}", MAX_RETRY, operationName, lastException);
+        throw new RuntimeException("操作失败，重试" + MAX_RETRY + "次后仍然失败: " + operationName, lastException);
+    }
+
+    private boolean executeWithRetry(String operationName, RetryRunnable action) {
+        executeWithRetry(operationName, () -> {
+            action.run();
+            return true;
+        });
+        return true;
+    }
+
+    private boolean isDeadlockRelated(Throwable t) {
+        if (t == null) return false;
+        String msg = t.getMessage();
+        if (msg == null) return false;
+        String lower = msg.toLowerCase();
+        return lower.contains("deadlock")
+                || lower.contains("lock")
+                || lower.contains("dead lock")
+                || lower.contains("could not obtain lock");
+    }
+
+    private void sleepBackoff(int attempt) {
+        try {
+            long sleepMs = RETRY_BASE_MS * (long) Math.pow(2, attempt - 1);
+            Thread.sleep(sleepMs);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

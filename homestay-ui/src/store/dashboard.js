@@ -12,7 +12,11 @@ export const useDashboardStore = defineStore('dashboard', {
     channelDistribution: [],
     heatmapData: [],
     lastUpdateTime: null,
-    wsConnected: false
+    wsConnected: false,
+    realtimeLoading: false,
+    channelLoading: false,
+    heatmapLoading: false,
+    heatmapError: false
   }),
   getters: {
     totalRooms: (state) => {
@@ -36,6 +40,7 @@ export const useDashboardStore = defineStore('dashboard', {
   },
   actions: {
     async fetchRealtimeData() {
+      this.realtimeLoading = true
       try {
         const res = await getRealtimeRoomStatus()
         if (res.code === 200) {
@@ -44,9 +49,13 @@ export const useDashboardStore = defineStore('dashboard', {
         }
       } catch (e) {
         console.error('获取实时房态失败', e)
+        this.realtimeData = []
+      } finally {
+        this.realtimeLoading = false
       }
     },
     async fetchChannelDistribution(startDate, endDate) {
+      this.channelLoading = true
       try {
         const res = await getChannelOrderDistribution(startDate, endDate)
         if (res.code === 200) {
@@ -54,16 +63,28 @@ export const useDashboardStore = defineStore('dashboard', {
         }
       } catch (e) {
         console.error('获取渠道分布失败', e)
+        this.channelDistribution = []
+      } finally {
+        this.channelLoading = false
       }
     },
     async fetchHeatmap(startDate, endDate) {
+      this.heatmapLoading = true
+      this.heatmapError = false
       try {
         const res = await getRoomTypeHeatmap(startDate, endDate)
         if (res.code === 200) {
           this.heatmapData = res.data || []
+        } else {
+          this.heatmapError = true
+          this.heatmapData = []
         }
       } catch (e) {
         console.error('获取热力图数据失败', e)
+        this.heatmapError = true
+        this.heatmapData = []
+      } finally {
+        this.heatmapLoading = false
       }
     },
     setRealtimeData(data) {
