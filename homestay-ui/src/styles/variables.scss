@@ -1,0 +1,30 @@
+$primary-color: #00d4ff;
+$secondary-color: #0066ff;
+$success-color: #00ffa3;
+$warning-color: #ffb547;
+$danger-color: #ff4d4f;
+$bg-dark: #0b1836;
+$bg-card: rgba(16, 38, 89, 0.6);
+$border-color: rgba(0, 212, 255, 0.3);
+$text-primary: #ffffff;
+$text-secondary: #a3b5d6;
+
+@mixin flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@mixin flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+@mixin card-style {
+  background: $bg-card;
+  border: 1px solid $border-color;
+  border-radius: 8px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 4px 20px rgba(0, 102, 255, 0.1);
+}
